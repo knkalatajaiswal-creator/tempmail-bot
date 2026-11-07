@@ -488,22 +488,27 @@ async def api_create_account(api_url, address, password):
                     if resp.status == 201: return True, "OK"
                     if resp.status == 422: return False, "taken"
                     if resp.status == 429 or 500 <= resp.status < 600:
+                        logger.warning("Mail provider account request returned HTTP %s", resp.status)
                         if attempt < API_MAX_RETRIES:
                             await _backoff(attempt, _retry_after(resp) if resp.status == 429 else None)
                             continue
-                        return False, "rate_limited" if resp.status == 429 else f"error_{resp.status}"
+                        return False, "rate_limited" if resp.status == 429 else "provider_unavailable"
                     try:
                         err = await resp.json()
+                        logger.warning("Mail provider account request returned HTTP %s", resp.status)
                         return False, err.get("detail", f"error_{resp.status}")
                     except (aiohttp.ContentTypeError, ValueError):
+                        logger.warning("Mail provider account request returned HTTP %s", resp.status)
                         return False, f"error_{resp.status}"
             except asyncio.TimeoutError:
-                return False, "timeout"  # don't replay an ambiguous POST
+                logger.warning("Mail provider account request timed out; not replaying ambiguous POST")
+                return False, "provider_unavailable"
             except aiohttp.ClientError as e:
                 if attempt < API_MAX_RETRIES:
                     await _backoff(attempt)
                     continue
-                return False, str(e)
+                logger.warning("Mail provider account request failed after retries (%s)", type(e).__name__)
+                return False, "provider_unavailable"
     return False, "rate_limited"
 
 async def api_get_token(api_url, address, password):
@@ -514,15 +519,23 @@ async def api_get_token(api_url, address, password):
             try:
                 async with session.post(f"{api_url}/token", json={"address": address, "password": password}) as resp:
                     if resp.status == 200:
-                        return (await resp.json()).get("token")
+                        token = (await resp.json()).get("token")
+                        return (token, None) if token else (None, "provider_error")
                     if resp.status == 429 or 500 <= resp.status < 600:
+                        logger.warning("Mail provider token request returned HTTP %s", resp.status)
                         if attempt < API_MAX_RETRIES:
                             await _backoff(attempt, _retry_after(resp) if resp.status == 429 else None)
                             continue
-            except (asyncio.TimeoutError, aiohttp.ClientError):
+                        return None, "rate_limited" if resp.status == 429 else "provider_unavailable"
+                    logger.warning("Mail provider token request returned HTTP %s", resp.status)
+                    return None, "provider_error"
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 if attempt < API_MAX_RETRIES:
                     await _backoff(attempt)
-    return None
+                    continue
+                logger.warning("Mail provider token request failed after retries (%s)", type(e).__name__)
+                return None, "provider_unavailable"
+    return None, "provider_unavailable"
 
 async def api_fetch_messages(api_url, token):
     session = await get_session()
@@ -679,12 +692,16 @@ async def generate_email(user_id: int, prefix: str = None) -> tuple[bool, str]:
 
         ok, msg = await api_create_account(target['api'], address, password)
         if not ok:
-            if msg == "rate_limited": return False, "rate_limited"
+            if msg in {"rate_limited", "provider_unavailable"}:
+                return False, msg
             if msg == "taken":        continue
             continue
 
-        token = await api_get_token(target['api'], address, password)
-        if not token: continue
+        token, token_error = await api_get_token(target['api'], address, password)
+        if not token:
+            if token_error in {"rate_limited", "provider_unavailable"}:
+                return False, token_error
+            continue
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -701,6 +718,7 @@ def format_gen_error(code: str) -> str:
     if code == "limit":           return f"❌ Limit reached ({MAX_EMAILS_PER_USER} max). Delete one first."
     if code == "no_domains":      return "❌ No mail domains available right now."
     if code == "rate_limited":    return "⚠️ API rate limited. Wait a moment and try again."
+    if code == "provider_unavailable": return "⚠️ Mail provider is temporarily unavailable. Please try again shortly."
     if code == "exhausted":       return "❌ All domains exhausted. Try a different name."
     if code == "invalid_prefix":  return "❌ Name must be 3–30 chars: letters, numbers, dots, hyphens, underscores only."
     if code.startswith("already_mine:"):
