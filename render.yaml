@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: tempmail-bot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: DB_PATH
+        value: /data/tempog_v26.db
+    disk:
+      name: botdata
+      mountPath: /data
+      sizeGB: 1

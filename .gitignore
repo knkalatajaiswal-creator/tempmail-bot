@@ -1,0 +1,42 @@
+# ── SECRETS ──────────────────────────────
+.env
+*.env
+.env.*
+secrets.py
+config.py
+
+# ── DATABASE (contains user data) ────────
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# ── PYTHON CACHE ─────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.py[cod]
+
+# ── LOGS ─────────────────────────────────
+*.log
+logs/
+
+# ── OS GARBAGE ───────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── EDITOR GARBAGE ───────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── VIRTUAL ENV ──────────────────────────
+venv/
+env/
+.venv/
+ENV/
