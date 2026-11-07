@@ -7,6 +7,7 @@ import logging
 import random
 import string
 import re
+import time
 import aiosqlite
 import aiohttp
 from datetime import datetime
@@ -23,6 +24,7 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiohttp import web
 
 # ══════════════════════════════════════════
 # CONFIGURATION
@@ -37,7 +39,8 @@ ADMIN_ID   = int(os.environ["ADMIN_ID"])
 DB_PATH    = os.environ.get("DB_PATH", "/data/tempog_v26.db")
 MAX_EMAILS_PER_USER  = 5      # 0 = unlimited
 VAULT_RETENTION_DAYS = 30
-POLL_INTERVAL        = 4      # seconds between inbox polls
+POLL_INTERVAL        = 15     # avoid hammering the provider from hosted instances
+API_MAX_RETRIES      = 3
 
 # Regex: valid custom prefix (3–30 alphanumeric / dot / hyphen / underscore)
 PREFIX_RE = re.compile(r'^[a-z0-9._\-]{3,30}$')
@@ -67,7 +70,14 @@ class AdminNote(StatesGroup):
 # ══════════════════════════════════════════
 GLOBAL_SESSION  = None
 CACHED_DOMAINS  = []
-API_SEMAPHORE   = asyncio.Semaphore(15)   # bumped from 10 → 15
+# A semaphore limits in-flight work, but does not limit request rate.  mail.tm
+# applies a shared per-IP quota, so hosted deployments must pace all requests.
+API_SEMAPHORE   = asyncio.Semaphore(4)
+POLL_SEMAPHORE  = asyncio.Semaphore(2)
+API_RATE_LOCK   = asyncio.Lock()
+API_NEXT_REQUEST_AT = {}
+API_MIN_INTERVAL = 0.25       # 4 requests/sec, below the documented 8 QPS
+ACCOUNT_CREATE_MIN_INTERVAL = 1.0  # account creation is more burst-sensitive
 
 FALLBACK_DOMAINS = [
     {"domain": "mail.tm",       "api": "https://api.mail.tm"},
@@ -93,6 +103,28 @@ async def get_session() -> aiohttp.ClientSession:
             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
         )
     return GLOBAL_SESSION
+
+async def _pace_api(api_url: str, *, account_creation: bool = False):
+    """Serialize request starts per provider IP and leave quota headroom."""
+    interval = ACCOUNT_CREATE_MIN_INTERVAL if account_creation else API_MIN_INTERVAL
+    async with API_RATE_LOCK:
+        now = time.monotonic()
+        wait_for = max(0.0, API_NEXT_REQUEST_AT.get(api_url, now) - now)
+        API_NEXT_REQUEST_AT[api_url] = max(now, API_NEXT_REQUEST_AT.get(api_url, now)) + interval
+    if wait_for:
+        await asyncio.sleep(wait_for)
+
+def _retry_after(response: aiohttp.ClientResponse) -> float | None:
+    value = response.headers.get("Retry-After")
+    try:
+        return max(0.0, float(value)) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+async def _backoff(attempt: int, retry_after: float | None = None):
+    # Honor the provider's delay when present; otherwise use bounded exponential backoff.
+    delay = retry_after if retry_after is not None else min(8.0, 1.0 * (2 ** attempt))
+    await asyncio.sleep(delay + random.uniform(0.0, 0.25))
 
 async def safe_send(chat_id: int, text: str, reply_markup=None) -> types.Message | None:
     try:
@@ -424,6 +456,7 @@ async def fetch_all_active_domains():
     global CACHED_DOMAINS
     session = await get_session()
     try:
+        await _pace_api("https://api.mail.tm")
         async with session.get("https://api.mail.tm/domains") as resp:
             if resp.status == 200:
                 data    = await resp.json()
@@ -447,66 +480,88 @@ async def get_domains():
 
 async def api_create_account(api_url, address, password):
     session = await get_session()
-    async with API_SEMAPHORE:
-        try:
-            async with session.post(
-                f"{api_url}/accounts",
-                json={"address": address, "password": password}
-            ) as resp:
-                if resp.status == 201: return True, "OK"
-                if resp.status == 429: return False, "rate_limited"
-                if resp.status == 422: return False, "taken"
-                try:
-                    err = await resp.json()
-                    return False, err.get("detail", f"error_{resp.status}")
-                except:
-                    return False, f"error_{resp.status}"
-        except asyncio.TimeoutError:
-            return False, "timeout"
-        except Exception as e:
-            return False, str(e)
+    for attempt in range(API_MAX_RETRIES + 1):
+        async with API_SEMAPHORE:
+            await _pace_api(api_url, account_creation=True)
+            try:
+                async with session.post(f"{api_url}/accounts", json={"address": address, "password": password}) as resp:
+                    if resp.status == 201: return True, "OK"
+                    if resp.status == 422: return False, "taken"
+                    if resp.status == 429 or 500 <= resp.status < 600:
+                        if attempt < API_MAX_RETRIES:
+                            await _backoff(attempt, _retry_after(resp) if resp.status == 429 else None)
+                            continue
+                        return False, "rate_limited" if resp.status == 429 else f"error_{resp.status}"
+                    try:
+                        err = await resp.json()
+                        return False, err.get("detail", f"error_{resp.status}")
+                    except (aiohttp.ContentTypeError, ValueError):
+                        return False, f"error_{resp.status}"
+            except asyncio.TimeoutError:
+                return False, "timeout"  # don't replay an ambiguous POST
+            except aiohttp.ClientError as e:
+                if attempt < API_MAX_RETRIES:
+                    await _backoff(attempt)
+                    continue
+                return False, str(e)
+    return False, "rate_limited"
 
 async def api_get_token(api_url, address, password):
     session = await get_session()
-    async with API_SEMAPHORE:
-        try:
-            async with session.post(
-                f"{api_url}/token",
-                json={"address": address, "password": password}
-            ) as resp:
-                if resp.status == 200:
-                    return (await resp.json()).get("token")
-        except:
-            pass
+    for attempt in range(API_MAX_RETRIES + 1):
+        async with API_SEMAPHORE:
+            await _pace_api(api_url)
+            try:
+                async with session.post(f"{api_url}/token", json={"address": address, "password": password}) as resp:
+                    if resp.status == 200:
+                        return (await resp.json()).get("token")
+                    if resp.status == 429 or 500 <= resp.status < 600:
+                        if attempt < API_MAX_RETRIES:
+                            await _backoff(attempt, _retry_after(resp) if resp.status == 429 else None)
+                            continue
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                if attempt < API_MAX_RETRIES:
+                    await _backoff(attempt)
     return None
 
 async def api_fetch_messages(api_url, token):
     session = await get_session()
-    async with API_SEMAPHORE:
-        try:
-            async with session.get(
-                f"{api_url}/messages",
-                headers={"Authorization": f"Bearer {token}"}
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data if isinstance(data, list) else data.get("hydra:member", [])
-        except:
-            pass
+    for attempt in range(API_MAX_RETRIES + 1):
+        async with API_SEMAPHORE:
+            await _pace_api(api_url)
+            try:
+                async with session.get(f"{api_url}/messages", headers={"Authorization": f"Bearer {token}"}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data if isinstance(data, list) else data.get("hydra:member", [])
+                    if resp.status == 429 or 500 <= resp.status < 600:
+                        if attempt < API_MAX_RETRIES:
+                            await _backoff(attempt, _retry_after(resp) if resp.status == 429 else None)
+                            continue
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                if attempt < API_MAX_RETRIES:
+                    await _backoff(attempt)
     return []
 
 async def api_fetch_body(api_url, token, msg_id):
     session = await get_session()
-    async with API_SEMAPHORE:
-        try:
-            async with session.get(
-                f"{api_url}/messages/{msg_id}",
-                headers={"Authorization": f"Bearer {token}"}
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-        except:
-            pass
+    for attempt in range(API_MAX_RETRIES + 1):
+        async with API_SEMAPHORE:
+            await _pace_api(api_url)
+            try:
+                async with session.get(
+                    f"{api_url}/messages/{msg_id}",
+                    headers={"Authorization": f"Bearer {token}"}
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    if resp.status == 429 or 500 <= resp.status < 600:
+                        if attempt < API_MAX_RETRIES:
+                            await _backoff(attempt, _retry_after(resp) if resp.status == 429 else None)
+                            continue
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                if attempt < API_MAX_RETRIES:
+                    await _backoff(attempt)
     return None
 
 # ══════════════════════════════════════════
@@ -1518,6 +1573,10 @@ async def _deliver(user_id, text, html_body, msg_id, subject, from_addr, ts):
         except Exception as e:
             logger.error(f"Deliver HTML: {e}")
 
+async def _poll_account_bounded(user_id: int, user_email: str, token: str):
+    async with POLL_SEMAPHORE:
+        await _poll_account(user_id, user_email, token)
+
 async def mail_poller():
     logger.info("Poller started.")
     await fetch_all_active_domains()
@@ -1528,7 +1587,7 @@ async def mail_poller():
                 async with db.execute("SELECT telegram_id, email, token FROM emails") as c:
                     accounts = await c.fetchall()
             if accounts:
-                await asyncio.gather(*[_poll_account(u, e, t) for u, e, t in accounts])
+                await asyncio.gather(*[_poll_account_bounded(u, e, t) for u, e, t in accounts])
             # Refresh domains every 100 cycles (~6 min), purge vault every 1000 cycles (~1hr)
             cycle += 1
             if cycle % 100  == 0: await fetch_all_active_domains()
@@ -1540,12 +1599,38 @@ async def mail_poller():
 # ══════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════
+async def health_check(request):
+    return web.Response(text="OK")
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", "10000"))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logger.info("Health server listening on 0.0.0.0:%s", port)
+    return runner
+
 async def main():
+    poller_task = None
+    health_runner = None
     await init_db()
-    await bot.delete_webhook(drop_pending_updates=True)
-    asyncio.create_task(mail_poller())
-    logger.info("TempOG v26 live.")
-    await dp.start_polling(bot)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        health_runner = await start_health_server()
+        poller_task = asyncio.create_task(mail_poller())
+        logger.info("TempOG v26 live.")
+        await dp.start_polling(bot)
+    finally:
+        if poller_task:
+            poller_task.cancel()
+            await asyncio.gather(poller_task, return_exceptions=True)
+        if health_runner:
+            await health_runner.cleanup()
+        if GLOBAL_SESSION and not GLOBAL_SESSION.closed:
+            await GLOBAL_SESSION.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
