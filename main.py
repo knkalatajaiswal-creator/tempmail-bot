@@ -11,6 +11,7 @@ import time
 import aiosqlite
 import aiohttp
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from html import escape
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -39,7 +40,7 @@ ADMIN_ID   = int(os.environ["ADMIN_ID"])
 DB_PATH    = os.environ.get("DB_PATH", "/data/tempog_v26.db")
 MAX_EMAILS_PER_USER  = 5      # 0 = unlimited
 VAULT_RETENTION_DAYS = 30
-POLL_INTERVAL        = 15     # avoid hammering the provider from hosted instances
+POLL_INTERVAL        = 30     # slower sweep; provider requests are paced globally below
 API_MAX_RETRIES      = 3
 
 # Regex: valid custom prefix (3–30 alphanumeric / dot / hyphen / underscore)
@@ -76,13 +77,12 @@ API_SEMAPHORE   = asyncio.Semaphore(4)
 POLL_SEMAPHORE  = asyncio.Semaphore(2)
 API_RATE_LOCK   = asyncio.Lock()
 API_NEXT_REQUEST_AT = {}
-API_MIN_INTERVAL = 0.25       # 4 requests/sec, below the documented 8 QPS
-ACCOUNT_CREATE_MIN_INTERVAL = 1.0  # account creation is more burst-sensitive
-
-FALLBACK_DOMAINS = [
-    {"domain": "mail.tm",       "api": "https://api.mail.tm"},
-    {"domain": "telegmail.com", "api": "https://api.mail.tm"},
-]
+API_COOLDOWN_UNTIL = {}
+API_MIN_INTERVAL = 1.0       # cap aggregate traffic at 1 request/sec per provider
+ACCOUNT_CREATE_MIN_INTERVAL = 2.0  # be extra conservative for account creation
+DEFAULT_RATE_LIMIT_COOLDOWN = 60.0
+DOMAIN_REFRESH_LOCK = asyncio.Lock()
+DOMAIN_LAST_FAILURE_UNTIL = 0.0
 
 # ══════════════════════════════════════════
 # HTTP SESSION
@@ -105,13 +105,19 @@ async def get_session() -> aiohttp.ClientSession:
     return GLOBAL_SESSION
 
 async def _pace_api(api_url: str, *, account_creation: bool = False):
-    """Serialize request starts per provider IP and leave quota headroom."""
+    """Pace request starts and make queued work observe provider-wide cooldowns."""
     interval = ACCOUNT_CREATE_MIN_INTERVAL if account_creation else API_MIN_INTERVAL
-    async with API_RATE_LOCK:
-        now = time.monotonic()
-        wait_for = max(0.0, API_NEXT_REQUEST_AT.get(api_url, now) - now)
-        API_NEXT_REQUEST_AT[api_url] = max(now, API_NEXT_REQUEST_AT.get(api_url, now)) + interval
-    if wait_for:
+    while True:
+        async with API_RATE_LOCK:
+            now = time.monotonic()
+            allowed_at = max(
+                API_NEXT_REQUEST_AT.get(api_url, now),
+                API_COOLDOWN_UNTIL.get(api_url, now),
+            )
+            if now >= allowed_at:
+                API_NEXT_REQUEST_AT[api_url] = now + interval
+                return
+            wait_for = allowed_at - now
         await asyncio.sleep(wait_for)
 
 def _retry_after(response: aiohttp.ClientResponse) -> float | None:
@@ -119,7 +125,26 @@ def _retry_after(response: aiohttp.ClientResponse) -> float | None:
     try:
         return max(0.0, float(value)) if value is not None else None
     except (TypeError, ValueError):
+        if value:
+            try:
+                return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                pass
         return None
+
+async def _apply_rate_limit(api_url: str, response: aiohttp.ClientResponse) -> int:
+    """Pause all calls to this provider after a 429; honor Retry-After when supplied."""
+    retry_after = _retry_after(response)
+    delay = max(1.0, retry_after if retry_after is not None else DEFAULT_RATE_LIMIT_COOLDOWN)
+    now = time.monotonic()
+    async with API_RATE_LOCK:
+        until = max(API_COOLDOWN_UNTIL.get(api_url, now), now + delay)
+        API_COOLDOWN_UNTIL[api_url] = until
+        API_NEXT_REQUEST_AT[api_url] = max(API_NEXT_REQUEST_AT.get(api_url, now), until)
+    return max(1, int(delay + 0.999))
+
+def _rate_limit_remaining(api_url: str) -> int:
+    return max(0, int(API_COOLDOWN_UNTIL.get(api_url, 0.0) - time.monotonic() + 0.999))
 
 async def _backoff(attempt: int, retry_after: float | None = None):
     # Honor the provider's delay when present; otherwise use bounded exponential backoff.
@@ -453,25 +478,37 @@ body{{background:var(--bg);color:var(--text);font-family:var(--font);
 # DOMAIN / API HELPERS
 # ══════════════════════════════════════════
 async def fetch_all_active_domains():
-    global CACHED_DOMAINS
-    session = await get_session()
-    try:
-        await _pace_api("https://api.mail.tm")
-        async with session.get("https://api.mail.tm/domains") as resp:
-            if resp.status == 200:
-                data    = await resp.json()
-                members = data if isinstance(data, list) else data.get("hydra:member", [])
-                domains = [
-                    {"domain": d["domain"], "api": "https://api.mail.tm"}
-                    for d in members if d.get("isActive", True)
-                ]
-                if domains:
-                    CACHED_DOMAINS = domains
+    global CACHED_DOMAINS, DOMAIN_LAST_FAILURE_UNTIL
+    async with DOMAIN_REFRESH_LOCK:
+        if time.monotonic() < DOMAIN_LAST_FAILURE_UNTIL:
+            return CACHED_DOMAINS
+        session = await get_session()
+        try:
+            await _pace_api("https://api.mail.tm")
+            async with session.get("https://api.mail.tm/domains") as resp:
+                if resp.status == 429:
+                    delay = await _apply_rate_limit("https://api.mail.tm", resp)
+                    DOMAIN_LAST_FAILURE_UNTIL = time.monotonic() + delay
+                    logger.warning("Mail provider domain list rate-limited; cooling down for %s seconds", delay)
                     return CACHED_DOMAINS
-    except Exception as e:
-        logger.error(f"Domain fetch: {e}")
-    CACHED_DOMAINS = FALLBACK_DOMAINS
-    return CACHED_DOMAINS
+                if resp.status == 200:
+                    data = await resp.json()
+                    members = data if isinstance(data, list) else data.get("hydra:member", [])
+                    domains = [
+                        {"domain": d["domain"], "api": "https://api.mail.tm"}
+                        for d in members if d.get("isActive", True)
+                    ]
+                    if domains:
+                        CACHED_DOMAINS = domains
+                        DOMAIN_LAST_FAILURE_UNTIL = 0.0
+                        return CACHED_DOMAINS
+                    logger.warning("Mail provider returned no active domains")
+                else:
+                    logger.warning("Mail provider domain list returned HTTP %s", resp.status)
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            logger.warning("Mail provider domain list failed (%s)", type(e).__name__)
+        DOMAIN_LAST_FAILURE_UNTIL = time.monotonic() + DEFAULT_RATE_LIMIT_COOLDOWN
+        return CACHED_DOMAINS
 
 async def get_domains():
     if not CACHED_DOMAINS:
@@ -487,12 +524,16 @@ async def api_create_account(api_url, address, password):
                 async with session.post(f"{api_url}/accounts", json={"address": address, "password": password}) as resp:
                     if resp.status == 201: return True, "OK"
                     if resp.status == 422: return False, "taken"
-                    if resp.status == 429 or 500 <= resp.status < 600:
+                    if resp.status == 429:
+                        delay = await _apply_rate_limit(api_url, resp)
+                        logger.warning("Mail provider account request rate-limited; shared cooldown is %s seconds", delay)
+                        return False, f"rate_limited:{delay}"
+                    if 500 <= resp.status < 600:
                         logger.warning("Mail provider account request returned HTTP %s", resp.status)
                         if attempt < API_MAX_RETRIES:
-                            await _backoff(attempt, _retry_after(resp) if resp.status == 429 else None)
+                            await _backoff(attempt)
                             continue
-                        return False, "rate_limited" if resp.status == 429 else "provider_unavailable"
+                        return False, "provider_unavailable"
                     try:
                         err = await resp.json()
                         logger.warning("Mail provider account request returned HTTP %s", resp.status)
@@ -521,12 +562,16 @@ async def api_get_token(api_url, address, password):
                     if resp.status == 200:
                         token = (await resp.json()).get("token")
                         return (token, None) if token else (None, "provider_error")
-                    if resp.status == 429 or 500 <= resp.status < 600:
+                    if resp.status == 429:
+                        delay = await _apply_rate_limit(api_url, resp)
+                        logger.warning("Mail provider token request rate-limited; shared cooldown is %s seconds", delay)
+                        return None, f"rate_limited:{delay}"
+                    if 500 <= resp.status < 600:
                         logger.warning("Mail provider token request returned HTTP %s", resp.status)
                         if attempt < API_MAX_RETRIES:
-                            await _backoff(attempt, _retry_after(resp) if resp.status == 429 else None)
+                            await _backoff(attempt)
                             continue
-                        return None, "rate_limited" if resp.status == 429 else "provider_unavailable"
+                        return None, "provider_unavailable"
                     logger.warning("Mail provider token request returned HTTP %s", resp.status)
                     return None, "provider_error"
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
@@ -547,9 +592,13 @@ async def api_fetch_messages(api_url, token):
                     if resp.status == 200:
                         data = await resp.json()
                         return data if isinstance(data, list) else data.get("hydra:member", [])
-                    if resp.status == 429 or 500 <= resp.status < 600:
+                    if resp.status == 429:
+                        delay = await _apply_rate_limit(api_url, resp)
+                        logger.warning("Mail provider inbox request rate-limited; shared cooldown is %s seconds", delay)
+                        return []
+                    if 500 <= resp.status < 600:
                         if attempt < API_MAX_RETRIES:
-                            await _backoff(attempt, _retry_after(resp) if resp.status == 429 else None)
+                            await _backoff(attempt)
                             continue
             except (asyncio.TimeoutError, aiohttp.ClientError):
                 if attempt < API_MAX_RETRIES:
@@ -568,9 +617,13 @@ async def api_fetch_body(api_url, token, msg_id):
                 ) as resp:
                     if resp.status == 200:
                         return await resp.json()
-                    if resp.status == 429 or 500 <= resp.status < 600:
+                    if resp.status == 429:
+                        delay = await _apply_rate_limit(api_url, resp)
+                        logger.warning("Mail provider message request rate-limited; shared cooldown is %s seconds", delay)
+                        return None
+                    if 500 <= resp.status < 600:
                         if attempt < API_MAX_RETRIES:
-                            await _backoff(attempt, _retry_after(resp) if resp.status == 429 else None)
+                            await _backoff(attempt)
                             continue
             except (asyncio.TimeoutError, aiohttp.ClientError):
                 if attempt < API_MAX_RETRIES:
@@ -668,6 +721,9 @@ async def generate_email(user_id: int, prefix: str = None) -> tuple[bool, str]:
 
     domains = await get_domains()
     if not domains:
+        cooldown = _rate_limit_remaining("https://api.mail.tm")
+        if cooldown:
+            return False, f"rate_limited:{cooldown}"
         return False, "no_domains"
 
     if prefix:
@@ -686,20 +742,24 @@ async def generate_email(user_id: int, prefix: str = None) -> tuple[bool, str]:
     else:
         prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
 
+    cooldown = _rate_limit_remaining("https://api.mail.tm")
+    if cooldown:
+        return False, f"rate_limited:{cooldown}"
+
     for target in domains:
         address  = f"{prefix}@{target['domain']}"
         password = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
 
         ok, msg = await api_create_account(target['api'], address, password)
         if not ok:
-            if msg in {"rate_limited", "provider_unavailable"}:
+            if msg.startswith("rate_limited") or msg == "provider_unavailable":
                 return False, msg
             if msg == "taken":        continue
             continue
 
         token, token_error = await api_get_token(target['api'], address, password)
         if not token:
-            if token_error in {"rate_limited", "provider_unavailable"}:
+            if (token_error or "").startswith("rate_limited") or token_error == "provider_unavailable":
                 return False, token_error
             continue
 
@@ -717,7 +777,12 @@ def format_gen_error(code: str) -> str:
     if code == "banned":          return "🚫 You are banned."
     if code == "limit":           return f"❌ Limit reached ({MAX_EMAILS_PER_USER} max). Delete one first."
     if code == "no_domains":      return "❌ No mail domains available right now."
-    if code == "rate_limited":    return "⚠️ API rate limited. Wait a moment and try again."
+    if code.startswith("rate_limited"):
+        try:
+            wait_seconds = max(1, int(code.split(":", 1)[1]))
+            return f"⚠️ Mail provider rate limit reached. Please wait about {wait_seconds} seconds, then try again."
+        except (IndexError, ValueError):
+            return "⚠️ Mail provider rate limit reached. Please wait a little, then try again."
     if code == "provider_unavailable": return "⚠️ Mail provider is temporarily unavailable. Please try again shortly."
     if code == "exhausted":       return "❌ All domains exhausted. Try a different name."
     if code == "invalid_prefix":  return "❌ Name must be 3–30 chars: letters, numbers, dots, hyphens, underscores only."
