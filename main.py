@@ -78,6 +78,7 @@ POLL_SEMAPHORE  = asyncio.Semaphore(2)
 API_RATE_LOCK   = asyncio.Lock()
 API_NEXT_REQUEST_AT = {}
 API_COOLDOWN_UNTIL = {}
+API_RATE_LIMIT_STREAK = {}
 API_MIN_INTERVAL = 1.0       # cap aggregate traffic at 1 request/sec per provider
 ACCOUNT_CREATE_MIN_INTERVAL = 2.0  # be extra conservative for account creation
 DEFAULT_RATE_LIMIT_COOLDOWN = 60.0
@@ -133,15 +134,28 @@ def _retry_after(response: aiohttp.ClientResponse) -> float | None:
         return None
 
 async def _apply_rate_limit(api_url: str, response: aiohttp.ClientResponse) -> int:
-    """Pause all calls to this provider after a 429; honor Retry-After when supplied."""
+    """Pause provider calls, backing off longer when repeated cooldowns don't help."""
     retry_after = _retry_after(response)
-    delay = max(1.0, retry_after if retry_after is not None else DEFAULT_RATE_LIMIT_COOLDOWN)
     now = time.monotonic()
     async with API_RATE_LOCK:
+        # Several requests may already be in flight when the first 429 arrives.
+        # Count that as one throttling episode, not several consecutive episodes.
+        if API_COOLDOWN_UNTIL.get(api_url, 0.0) <= now:
+            API_RATE_LIMIT_STREAK[api_url] = API_RATE_LIMIT_STREAK.get(api_url, 0) + 1
+        streak = API_RATE_LIMIT_STREAK.get(api_url, 1)
+        # Repeating the same 60-second retry interval can create an endless 429 loop.
+        # Increase the quiet period up to 15 minutes until a request succeeds.
+        backoff = min(900.0, DEFAULT_RATE_LIMIT_COOLDOWN * (2 ** min(streak - 1, 4)))
+        delay = max(1.0, retry_after if retry_after is not None else backoff)
         until = max(API_COOLDOWN_UNTIL.get(api_url, now), now + delay)
         API_COOLDOWN_UNTIL[api_url] = until
         API_NEXT_REQUEST_AT[api_url] = max(API_NEXT_REQUEST_AT.get(api_url, now), until)
     return max(1, int(delay + 0.999))
+
+async def _clear_rate_limit(api_url: str):
+    """Reset escalating backoff after the provider accepts a request."""
+    async with API_RATE_LOCK:
+        API_RATE_LIMIT_STREAK.pop(api_url, None)
 
 def _rate_limit_remaining(api_url: str) -> int:
     return max(0, int(API_COOLDOWN_UNTIL.get(api_url, 0.0) - time.monotonic() + 0.999))
@@ -522,7 +536,9 @@ async def api_create_account(api_url, address, password):
             await _pace_api(api_url, account_creation=True)
             try:
                 async with session.post(f"{api_url}/accounts", json={"address": address, "password": password}) as resp:
-                    if resp.status == 201: return True, "OK"
+                    if resp.status == 201:
+                        await _clear_rate_limit(api_url)
+                        return True, "OK"
                     if resp.status == 422: return False, "taken"
                     if resp.status == 429:
                         delay = await _apply_rate_limit(api_url, resp)
@@ -560,6 +576,7 @@ async def api_get_token(api_url, address, password):
             try:
                 async with session.post(f"{api_url}/token", json={"address": address, "password": password}) as resp:
                     if resp.status == 200:
+                        await _clear_rate_limit(api_url)
                         token = (await resp.json()).get("token")
                         return (token, None) if token else (None, "provider_error")
                     if resp.status == 429:
@@ -590,6 +607,7 @@ async def api_fetch_messages(api_url, token):
             try:
                 async with session.get(f"{api_url}/messages", headers={"Authorization": f"Bearer {token}"}) as resp:
                     if resp.status == 200:
+                        await _clear_rate_limit(api_url)
                         data = await resp.json()
                         return data if isinstance(data, list) else data.get("hydra:member", [])
                     if resp.status == 429:
@@ -616,6 +634,7 @@ async def api_fetch_body(api_url, token, msg_id):
                     headers={"Authorization": f"Bearer {token}"}
                 ) as resp:
                     if resp.status == 200:
+                        await _clear_rate_limit(api_url)
                         return await resp.json()
                     if resp.status == 429:
                         delay = await _apply_rate_limit(api_url, resp)
@@ -759,9 +778,16 @@ async def generate_email(user_id: int, prefix: str = None) -> tuple[bool, str]:
 
         token, token_error = await api_get_token(target['api'], address, password)
         if not token:
-            if (token_error or "").startswith("rate_limited") or token_error == "provider_unavailable":
-                return False, token_error
-            continue
+            # The provider has already created this mailbox. Keep it locally even if
+            # token issuance is throttled, so retries don't create orphan accounts.
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT OR IGNORE INTO emails (email, telegram_id, password, token) VALUES (?,?,?,NULL)",
+                    (address, user_id, password)
+                )
+                await db.commit()
+            logger.warning("Mailbox created but token is pending for %s (%s)", address, token_error)
+            return True, address
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -1604,6 +1630,26 @@ async def _admin_audit_page(message, page: int):
 # BACKGROUND POLLER
 # ══════════════════════════════════════════
 async def _poll_account(user_id: int, user_email: str, token: str):
+    if not token:
+        # A mailbox may have been created just before mail.tm throttled token
+        # issuance. Retry token setup during normal polling instead of losing it.
+        if _rate_limit_remaining("https://api.mail.tm"):
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT password FROM emails WHERE email=? AND telegram_id=?",
+                (user_email, user_id)
+            ) as c:
+                row = await c.fetchone()
+        if not row:
+            return
+        token, error = await api_get_token("https://api.mail.tm", user_email, row[0])
+        if not token:
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE emails SET token=? WHERE email=?", (token, user_email))
+            await db.commit()
+
     messages = await api_fetch_messages("https://api.mail.tm", token)
     if not messages: return
 
