@@ -105,19 +105,21 @@ async def get_session() -> aiohttp.ClientSession:
         )
     return GLOBAL_SESSION
 
-async def _pace_api(api_url: str, *, account_creation: bool = False):
+async def _pace_api(api_url: str, *, account_creation: bool = False, skip_during_cooldown: bool = False):
     """Pace request starts and make queued work observe provider-wide cooldowns."""
     interval = ACCOUNT_CREATE_MIN_INTERVAL if account_creation else API_MIN_INTERVAL
     while True:
         async with API_RATE_LOCK:
             now = time.monotonic()
+            if skip_during_cooldown and API_COOLDOWN_UNTIL.get(api_url, 0.0) > now:
+                return False
             allowed_at = max(
                 API_NEXT_REQUEST_AT.get(api_url, now),
                 API_COOLDOWN_UNTIL.get(api_url, now),
             )
             if now >= allowed_at:
                 API_NEXT_REQUEST_AT[api_url] = now + interval
-                return
+                return True
             wait_for = allowed_at - now
         await asyncio.sleep(wait_for)
 
@@ -572,7 +574,8 @@ async def api_get_token(api_url, address, password):
     session = await get_session()
     for attempt in range(API_MAX_RETRIES + 1):
         async with API_SEMAPHORE:
-            await _pace_api(api_url)
+            if not await _pace_api(api_url, skip_during_cooldown=True):
+                return None, f"rate_limited:{_rate_limit_remaining(api_url)}"
             try:
                 async with session.post(f"{api_url}/token", json={"address": address, "password": password}) as resp:
                     if resp.status == 200:
@@ -603,7 +606,8 @@ async def api_fetch_messages(api_url, token):
     session = await get_session()
     for attempt in range(API_MAX_RETRIES + 1):
         async with API_SEMAPHORE:
-            await _pace_api(api_url)
+            if not await _pace_api(api_url, skip_during_cooldown=True):
+                return []
             try:
                 async with session.get(f"{api_url}/messages", headers={"Authorization": f"Bearer {token}"}) as resp:
                     if resp.status == 200:
@@ -627,7 +631,8 @@ async def api_fetch_body(api_url, token, msg_id):
     session = await get_session()
     for attempt in range(API_MAX_RETRIES + 1):
         async with API_SEMAPHORE:
-            await _pace_api(api_url)
+            if not await _pace_api(api_url, skip_during_cooldown=True):
+                return None
             try:
                 async with session.get(
                     f"{api_url}/messages/{msg_id}",
