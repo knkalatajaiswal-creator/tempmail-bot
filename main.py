@@ -40,7 +40,7 @@ ADMIN_ID   = int(os.environ["ADMIN_ID"])
 DB_PATH    = os.environ.get("DB_PATH", "/data/tempog_v26.db")
 MAX_EMAILS_PER_USER  = 5      # 0 = unlimited
 VAULT_RETENTION_DAYS = 30
-POLL_INTERVAL        = 30     # slower sweep; provider requests are paced globally below
+POLL_INTERVAL        = 60     # reduce background traffic to mail.tm on shared hosting
 API_MAX_RETRIES      = 3
 
 # Regex: valid custom prefix (3–30 alphanumeric / dot / hyphen / underscore)
@@ -74,7 +74,8 @@ CACHED_DOMAINS  = []
 # A semaphore limits in-flight work, but does not limit request rate.  mail.tm
 # applies a shared per-IP quota, so hosted deployments must pace all requests.
 API_SEMAPHORE   = asyncio.Semaphore(4)
-POLL_SEMAPHORE  = asyncio.Semaphore(2)
+POLL_SEMAPHORE  = asyncio.Semaphore(1)
+GENERATION_LOCKS = {}
 API_RATE_LOCK   = asyncio.Lock()
 API_NEXT_REQUEST_AT = {}
 API_COOLDOWN_UNTIL = {}
@@ -726,7 +727,7 @@ def kb_admin_user(uid, banned):
 # ══════════════════════════════════════════
 # CORE — GENERATE EMAIL
 # ══════════════════════════════════════════
-async def generate_email(user_id: int, prefix: str = None) -> tuple[bool, str]:
+async def _generate_email_locked(user_id: int, prefix: str = None) -> tuple[bool, str]:
     """
     Returns (success, result).
     result is the new email address on success, or an error code string on failure:
@@ -803,6 +804,12 @@ async def generate_email(user_id: int, prefix: str = None) -> tuple[bool, str]:
         return True, address
 
     return False, "exhausted"
+
+async def generate_email(user_id: int, prefix: str = None) -> tuple[bool, str]:
+    """Serialize generation attempts per user so rapid taps don't duplicate API work."""
+    lock = GENERATION_LOCKS.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        return await _generate_email_locked(user_id, prefix)
 
 def format_gen_error(code: str) -> str:
     if code == "banned":          return "🚫 You are banned."
@@ -1722,7 +1729,8 @@ async def mail_poller():
                     accounts = await c.fetchall()
             if accounts:
                 await asyncio.gather(*[_poll_account_bounded(u, e, t) for u, e, t in accounts])
-            # Refresh domains every 100 cycles (~6 min), purge vault every 1000 cycles (~1hr)
+            # With a 60-second poll interval, refresh domains every 100 cycles (~100 min)
+            # and purge the vault every 1000 cycles (~16.7 hours).
             cycle += 1
             if cycle % 100  == 0: await fetch_all_active_domains()
             if cycle % 1000 == 0: await purge_old_vault()
